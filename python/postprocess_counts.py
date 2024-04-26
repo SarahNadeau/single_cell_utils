@@ -123,8 +123,8 @@ def concat_adatas(adata1, adata2, outfile=None, label=None, keys=None):
 
 
 def load_data(adata, metadata=None, metadata_sep=",", metadata_colname_sample="sample", gtf=None):
-    logger.info("Loading adata from file")
     adata = sc.read_h5ad(adata)
+    logger.info(f"Loaded adata with {adata.n_obs} observations and {adata.n_vars} variables")
 
     if metadata:
         logger.info("Loading and merging metadata")
