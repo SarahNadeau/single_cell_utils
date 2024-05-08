@@ -3,7 +3,7 @@ import logging
 
 import pandas as pd
 import numpy as np
-import pyranges as pr
+from gtfparse import read_gtf
 import scanpy as sc
 import anndata as ad
 
@@ -122,47 +122,71 @@ def concat_adatas(adata1, adata2, outfile=None, label=None, keys=None):
         return adata
 
 
-def load_data(adata, metadata=None, metadata_sep=",", metadata_colname_sample="sample", gtf=None):
+def load_data(
+    adata,
+    metadata=None,
+    metadata_sep=",",
+    metadata_colname_sample="sample",
+    gtf=None,
+    gtf_cols=["seqname", "gene_name", "gene_id", "gene_biotype"],
+    gtf_gene_id_colname="gene_id",
+    gtf_gene_name_colname="gene_name",
+):
     adata = sc.read_h5ad(adata)
-    logger.info(f"Loaded adata with {adata.n_obs} observations and {adata.n_vars} variables")
+    logger.info(
+        f"Loaded adata with {adata.n_obs} observations and {adata.n_vars} variables"
+    )
 
     if metadata:
         logger.info("Loading and merging metadata")
-        metadata = pd.read_csv(metadata, sep=metadata_sep, dtype={metadata_colname_sample: str})
+        metadata = pd.read_csv(
+            metadata, sep=metadata_sep, dtype={metadata_colname_sample: str}
+        )
 
         # Add metadata to count data
         adata.obs["cell_id"] = adata.obs.index
         adata.obs = adata.obs.merge(
-            right=metadata, how="left", left_on="cell_id", right_on=metadata_colname_sample
+            right=metadata,
+            how="left",
+            left_on="cell_id",
+            right_on=metadata_colname_sample,
         )
 
     if gtf:
         logger.info("Loading and merging genome annotations")
-        annotations = pr.read_gtf(gtf)
+        annotations = read_gtf(
+            gtf,
+            features=["gene"],
+            usecols=gtf_cols,
+            result_type="pandas",
+        )
+        
+        duplicates = annotations.loc[annotations.duplicated(subset="gene_id", keep=False).values, :]
+        if duplicates.shape[0] > 0:
+            logger.warn(f"Some {gtf_gene_id_colname} values duplicated in GTF file, will keep only one:\n{duplicates}")
+            annotations = annotations.groupby(gtf_gene_id_colname).head(1)
 
-        # Add gene names to count data
-        gene_name_mapping = annotations[annotations.Feature == "gene"].df[
-            ["gene_id", "gene_name"]
-        ]
+        # Add gene names to count data (Geneid is name of index)
         adata.var = adata.var.merge(
-            right=gene_name_mapping, how="left", left_on="Geneid", right_on="gene_id"
+            right=annotations, how="left", left_on="Geneid", right_on=gtf_gene_id_colname
         )
         # Use gene_id if there's no gene_name in annotations
-        adata.var.gene_name.fillna("", inplace=True)
+        adata.var[gtf_gene_name_colname].fillna("", inplace=True)
         j = 0
         for i in range(adata.var.shape[0]):
-            gene_name = adata.var.iloc[i]["gene_name"]
+            gene_name = adata.var.iloc[i][gtf_gene_name_colname]
             if gene_name == "":
                 j += 1
-                gene_id = adata.var.iloc[i]["gene_id"]
-                adata.var.iat[i, 6] = gene_id
+                gene_id = adata.var.iloc[i][gtf_gene_id_colname]
+                gene_name_idx = int(np.where(adata.var.columns == gtf_gene_name_colname)[0])
+                adata.var.iat[i, gene_name_idx] = gene_id
 
         # Make variables index gene names
-        adata.var.set_index("gene_name", inplace=True, drop=False)
+        adata.var.set_index(gtf_gene_name_colname, inplace=True, drop=False)
         adata.var_names_make_unique()
 
         logger.info(
-            f"{j} out of {i + 1} genes had no gene_name entry, using gene_ids instead"
+            f"{j} out of {i + 1} genes had no {gtf_gene_name_colname} entry, using {gtf_gene_id_colname} instead"
         )
 
     return adata
@@ -180,7 +204,9 @@ def filter_cells(
     )
 
     # Filter out cells with >X% reads mapping intergenic regions
-    if ("n_reads_mapped_genes" in adata.obs.columns) & ("n_total_mappings" in adata.obs.columns):
+    if ("n_reads_mapped_genes" in adata.obs.columns) & (
+        "n_total_mappings" in adata.obs.columns
+    ):
         n_total_cells = adata.shape[0]
         n_filtered_cells = sum(
             np.divide(adata.obs.n_reads_mapped_genes, adata.obs.n_total_mappings)
@@ -211,11 +237,15 @@ def filter_cells(
     return adata
 
 
-def filter_genes(adata, gene_colname="gene_name", genes_to_remove=None, genes_to_normalize_with=None, min_cells=None):
+def filter_genes(
+    adata,
+    gene_colname="gene_name",
+    genes_to_remove=None,
+    genes_to_normalize_with=None,
+    min_cells=None,
+):
     if gene_colname in adata.var.columns:
-        logger.info(
-            f"Using gene names in adata.var column {gene_colname}"
-        )
+        logger.info(f"Using gene names in adata.var column {gene_colname}")
     else:
         logger.info(
             f"Adding column {gene_colname} to adata.var with index values to facilitate gene filtering"
@@ -243,7 +273,9 @@ def filter_genes(adata, gene_colname="gene_name", genes_to_remove=None, genes_to
     # Optionally filter to only certain genes for normalization
     if not genes_to_normalize_with is None:
         adata.var["gene_name_upper"] = adata.var[gene_colname].str.upper()
-        adata.var["to_normalize_with"] = adata.var["gene_name_upper"].isin(genes_to_normalize_with)
+        adata.var["to_normalize_with"] = adata.var["gene_name_upper"].isin(
+            genes_to_normalize_with
+        )
 
         n_to_normalize_with = sum(adata.var["to_normalize_with"])
         adata = adata[:, adata.var.to_normalize_with]
@@ -251,7 +283,7 @@ def filter_genes(adata, gene_colname="gene_name", genes_to_remove=None, genes_to
         logger.info(
             f"Filtered to {n_to_normalize_with} genes specificd to normalize with"
         )
-    
+
     # Optionally filter out genes present in fewer than min_cells cells
     if not min_cells is None:
         n_genes_before = adata.n_vars
@@ -261,9 +293,7 @@ def filter_genes(adata, gene_colname="gene_name", genes_to_remove=None, genes_to
             f"Filtered out {n_genes_filtered} genes present in < {min_cells} cells"
         )
 
-    logger.info(
-        f"{adata.n_vars} genes remain after gene-based filtering"
-    )
+    logger.info(f"{adata.n_vars} genes remain after gene-based filtering")
 
     return adata
 
